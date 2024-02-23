@@ -1,10 +1,12 @@
+require('dotenv').config()
 const express = require('express');
 const app = express();
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY)
+
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const port = process.env.PORT || 5000;
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-require('dotenv').config()
 
 //middleware
 app.use(cors())
@@ -34,6 +36,7 @@ async function run() {
     const menuCollection = client.db('bistro').collection('menu');
     const reviewCollection = client.db('bistro').collection('reviews');
     const orderCollection = client.db('bistro').collection('orders');
+    const paymentCollection = client.db('bistro').collection('payments');
     try {
         // await client.connect();
 
@@ -193,7 +196,72 @@ async function run() {
             const result = await orderCollection.deleteOne(query);
             res.send(result)
         });
-        console.log("Pinged your deployment. You successfully connected to MongoDB!");
+
+        //payment 
+        app.post('/create-payment-intent', async (req, res) => {
+            const { price } = req.body;
+            const amount = parseInt(price * 100);
+
+            // Create a PaymentIntent with the order amount and currency
+            const paymentIntent = await stripe.paymentIntents.create({
+                amount: amount,
+                currency: "usd",
+                // In the latest version of the API, specifying the `automatic_payment_methods` parameter is optional because Stripe enables its functionality by default.
+                payment_method_types: ['card']
+            });
+
+            res.send({
+                clientSecret: paymentIntent.client_secret,
+            });
+        });
+
+
+        app.get('/payments/:email', verifyToken, async (req, res) => {
+            const email = req.params.email;
+            const query = { email: email };
+            if (email !== req.decoded.email) {
+                return res.status(403).send({ message: 'unauthorized access' })
+            }
+            const result = await paymentCollection.find(query).toArray();
+            res.send(result);
+        })
+
+        app.post('/payments', async (req, res) => {
+            const payment = req.body;
+            const paymentResult = await paymentCollection.insertOne(payment);
+
+            const query = {
+                _id: {
+                    $in: payment.cartId.map(id => new ObjectId(id))
+                }
+            };
+            const deletedCart = await orderCollection.deleteMany(query);
+            res.send({ paymentResult, deletedCart })
+        })
+
+        //admin stats
+        app.get('/admin-stats', verifyToken, verifyAdmin, async (req, res) => {
+            const users = await userCollection.estimatedDocumentCount();
+            const menuItems = await menuCollection.estimatedDocumentCount();
+            const orders = await orderCollection.estimatedDocumentCount();
+            const result = await paymentCollection.aggregate([
+                {
+                    $group: {
+                        _id: null,
+                        totalRevenue: {
+                            $sum: '$price'
+                        }
+                    }
+                }
+            ]).toArray();
+            const revenue = result.length > 0 ? result[0].totalRevenue : 0;
+            res.send({
+                users,
+                menuItems,
+                orders,
+                revenue
+            })
+        });
     } finally {
         // Ensures that the client will close when you finish/error
         // await client.close();
